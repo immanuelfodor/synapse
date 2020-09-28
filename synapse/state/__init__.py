@@ -13,11 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import heapq
 import logging
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from typing import (
     Awaitable,
+    DefaultDict,
     Dict,
     Iterable,
     List,
@@ -37,6 +38,7 @@ from synapse.api.constants import EventTypes
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS, StateResolutionVersions
 from synapse.events import EventBase
 from synapse.events.snapshot import EventContext
+from synapse.logging.context import ContextResourceUsage
 from synapse.logging.utils import log_function
 from synapse.state import v1, v2
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
@@ -48,7 +50,7 @@ from synapse.util.caches.expiringcache import ExpiringCache
 from synapse.util.metrics import Measure, measure_func
 
 logger = logging.getLogger(__name__)
-
+metrics_logger = logging.getLogger("synapse.state.metrics")
 
 # Metrics for number of state groups involved in a resolution.
 state_groups_histogram = Histogram(
@@ -459,6 +461,21 @@ class StateHandler:
         return {key: state_map[ev_id] for key, ev_id in new_state.items()}
 
 
+@attr.s
+class _StateResMetrics:
+    """Keeps track of some usage metrics about state res."""
+
+    # System and User CPU time, in seconds
+    cpu_time = attr.ib(type=float, default=0.0)
+
+    # time spent on database transactions (excluding scheduling time). This roughly
+    # corresponds to the amount of work done on the db server, excluding event fetches.
+    db_time = attr.ib(type=float, default=0.0)
+
+    # number of events fetched from the db.
+    db_events = attr.ib(type=int, default=0)
+
+
 class StateResolutionHandler:
     """Responsible for doing state conflict resolution.
 
@@ -480,6 +497,13 @@ class StateResolutionHandler:
             iterable=True,
             reset_expiry_on_get=True,
         )
+
+        # tracks the amount of work done on state res per room
+        self._state_res_metrics = defaultdict(
+            _StateResMetrics
+        )  # type: DefaultDict[str, _StateResMetrics]
+
+        self.clock.looping_call(self._report_metrics, 120 * 1000)
 
     @log_function
     async def resolve_state_groups(
@@ -578,21 +602,58 @@ class StateResolutionHandler:
         Returns:
             a map from (type, state_key) to event_id.
         """
-        with Measure(self.clock, "state._resolve_events"):
-            v = KNOWN_ROOM_VERSIONS[room_version]
-            if v.state_res == StateResolutionVersions.V1:
-                return await v1.resolve_events_with_store(
-                    room_id, state_sets, event_map, state_res_store.get_events
-                )
-            else:
-                return await v2.resolve_events_with_store(
-                    self.clock,
-                    room_id,
-                    room_version,
-                    state_sets,
-                    event_map,
-                    state_res_store,
-                )
+        try:
+            with Measure(self.clock, "state._resolve_events") as m:
+                v = KNOWN_ROOM_VERSIONS[room_version]
+                if v.state_res == StateResolutionVersions.V1:
+                    return await v1.resolve_events_with_store(
+                        room_id, state_sets, event_map, state_res_store.get_events
+                    )
+                else:
+                    return await v2.resolve_events_with_store(
+                        self.clock,
+                        room_id,
+                        room_version,
+                        state_sets,
+                        event_map,
+                        state_res_store,
+                    )
+        finally:
+            self._record_state_res_metrics(room_id, m.get_resource_usage())
+
+    def _record_state_res_metrics(self, room_id: str, rusage: ContextResourceUsage):
+        room_metrics = self._state_res_metrics[room_id]
+        room_metrics.cpu_time += rusage.ru_utime + rusage.ru_stime
+        room_metrics.db_time += rusage.db_txn_duration_sec
+        room_metrics.db_events += rusage.evt_db_fetch_count
+
+    def _report_metrics(self):
+        if not metrics_logger.isEnabledFor(logging.DEBUG):
+            self._state_res_metrics.clear()
+            return
+
+        N_TO_LOG = 10
+
+        items = self._state_res_metrics.items()
+        x = [
+            "%s (%gs)" % (k, v.cpu_time)
+            for k, v in reversed(
+                heapq.nlargest(N_TO_LOG, items, key=lambda k, v: v.cpu_time)
+            )
+        ]
+        metrics_logger.debug(
+            "%i worst rooms for state-res by CPU time: %s", N_TO_LOG, x,
+        )
+
+        x = [
+            "%s (%gs)" % (k, v.db_time)
+            for k, v in reversed(
+                heapq.nlargest(N_TO_LOG, items, key=lambda k, v: v.db_time)
+            )
+        ]
+        metrics_logger.debug("%i worst rooms for state-res by DB time: %s", N_TO_LOG, x)
+
+        self._state_res_metrics.clear()
 
 
 def _make_state_cache_entry(
